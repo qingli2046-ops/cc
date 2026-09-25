@@ -1,248 +1,335 @@
 //@version=6
-indicator("15m Displacement Low v17", shorttitle = "DL15 v17", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+indicator("15m Displacement Low v18", shorttitle = "DL15 v18", overlay = true, max_boxes_count = 500, max_labels_count = 500)
 
-// v17 - two-candle higher-low formation with no minimum D distance.
-//   Candle 2 must make a higher low, and at least one formation candle must be green.
-//   R (stop distance) = C2 - L2           must be >= minRiskPts
-//   Entry = C2 close, stop = L2. Optional TP floor/cap clamp R to the selected range.
-//   Candle 3 executes only when it is green and receives a green dot below it.
-//   Starting with candle 3, the active TP is checked before SL on each 15m
-//   candle. The outcome candle receives a check or X above it. A candle touching
-//   both is a TP success, permanently.
-//   Patterns: A = G/G, B = R/G, C = G/R only when candle 2's lower wick is at least
-//   wickPct of its range. A red candle 2 with a short wick (the old "D" case) never
-//   qualifies. No D/R ratio gate; the ratio is shown for information only.
+// DL15 v18: 15m two-candle higher-low long, scored as a live scalp.
+//
+// FORMATION  (C1, C2 = two consecutive 15m candles)
+//   - C2 low is above C1 low (higher low). D = C2 low - C1 low, for information.
+//   - At least one of C1 / C2 is green.
+//   - R = C2 close - C2 low. The setup counts only when R >= Minimum SL (default 30).
+//   - Pattern, information only: A = G/G, B = R/G, C = G/R, "doji" = one flat candle.
+//     ★ = C2 green and closing in the top part of its range.
+//
+// TRADE  (entry = C2 close = C3 open; the C3 close is never used as an entry)
+//   - Stop = C2 low, exactly 1R below entry.
+//   - Scalp TP = entry + 1R, raised to the TP floor (25) and capped at the TP cap (30).
+//     With the default 30-point minimum SL the scalp TP is always entry + 30.
+//     Reaching it scores a win.
+//   - The honest 1R target (entry + R) is always drawn as a dashed box. It is a visual
+//     aid only and does not affect scoring.
+//
+// CANDLE 3  (every setup is a trade from C3 open, whatever C3 does)
+//   - C3 closes green: green dot under C3.
+//   - C3 closes red or flat: amber ⚠ under C3 and the setup turns amber. The trade stays
+//     live and scored. Treat it as weak: tighten the stop or exit early, do not add.
+//
+// SCORING  (from C3 on, each 15m candle)
+//   - Win when the high reaches the scalp TP, loss when the low reaches the stop.
+//     ✓ / ✕ above the candle.
+//   - A candle reaching both levels is settled with 1m data (first touch wins). With no
+//     1m data, or when one 1m candle reaches both, it counts as a loss (see settings).
+//   - A loss that opens beyond the stop (session gap) is booked at the open.
+//   - Panel: W / L, win %, net and average points over the loaded history, split by C3
+//     colour, plus what the red-C3 trades made if closed at the C3 close instead.
 
-// ---------------------------------------------------------------- rules
-float minDPts    = 0.0
-float minRiskPts = input.float(10.0, "Minimum R  (points)", minval = 0.0, step = 1.0, group = "Stop (R = C2 - L2)", tooltip = "Absolute floor so the stop is never inside normal liquidity noise.")
-// Either formation candle may be green.
-// Pattern C has no wick requirement in v13.
-bool  useMaxTp   = input.bool(true, "Limit TP distance", group = "Outcomes", tooltip = "When enabled, TP uses the smaller of 1R and the maximum TP distance.")
-float maxTpPts   = input.float(100.0, "Maximum TP  (points)", minval = 0.25, step = 0.25, group = "Outcomes")
-bool  useMinTp   = input.bool(true, "Minimum TP distance", group = "Outcomes", tooltip = "When enabled, TP is at least this distance even when 1R is smaller.")
-float minTpPts   = input.float(30.0, "Minimum TP  (points)", minval = 0.25, step = 0.25, group = "Outcomes")
+// ---------------------------------------------------------------- inputs
+float  minRiskPts = input.float(30.0, "Minimum SL / R  (points)", minval = 0.25, step = 0.25, group = "Trade", tooltip = "R = C2 close - C2 low. Setups with a smaller R are ignored and never scored.")
+bool   useTpFloor = input.bool(true, "Use TP floor", group = "Trade", tooltip = "Scalp TP is at least the floor, even when 1R is smaller.")
+float  tpFloorPts = input.float(25.0, "TP floor  (points)", minval = 0.25, step = 0.25, group = "Trade")
+bool   useTpCap   = input.bool(true, "Use TP cap", group = "Trade", tooltip = "Scalp TP is at most the cap. Reaching the scalp TP scores a win.")
+float  tpCapPts   = input.float(30.0, "TP cap  (points)", minval = 0.25, step = 0.25, group = "Trade")
+string tieMode    = input.string("1m data, else loss", "Candle reaches TP and stop", options = ["1m data, else loss", "Always loss", "Always win"], group = "Trade", tooltip = "How a 15m candle that reaches both levels is scored. 1m data checks which level came first; when it cannot tell, the candle counts as a loss.")
+float  strongPct  = input.float(66.0, "★ strong close  (% of C2 range)", minval = 0.0, maxval = 100.0, step = 1.0, group = "Trade")
 
-// ---------------------------------------------------------------- display
-int    drawnZones = input.int(6, "Zones drawn on chart", minval = 1, maxval = 40, group = "Display")
+int    drawnZones = input.int(6, "Setups drawn on chart", minval = 1, maxval = 40, group = "Display")
 int    monitored  = input.int(50, "Setups monitored (invisible)", minval = 1, maxval = 150, group = "Display")
 string labelMode  = input.string("Latest only", "Setup labels", options = ["None", "Latest only", "All drawn"], group = "Display")
-bool   keepTested = input.bool(true, "Keep tested zones on chart", group = "Display")
-bool   showMarks  = input.bool(true, "Show execution dot / check / X markers", group = "Display")
+bool   keepTested = input.bool(true, "Keep finished setups on chart", group = "Display")
+bool   showMarks  = input.bool(true, "Show C3 dot / ⚠ and ✓ / ✕ markers", group = "Display")
 bool   showPanel  = input.bool(true, "Show panel", group = "Display")
 color  zoneColor  = input.color(#26A69A, "Zone", group = "Display")
-color  starColor  = input.color(#00BFA5, "Strong-close zone", group = "Display")
-color  stopColor  = input.color(#EF5350, "Stop", group = "Display")
-color  testedColor = input.color(#78909C, "Tested", group = "Display")
+color  starColor  = input.color(#00BFA5, "Strong close / win", group = "Display")
+color  stopColor  = input.color(#EF5350, "Stop / loss", group = "Display")
+color  warnColor  = input.color(#FFA726, "C3 red warning", group = "Display")
+color  doneColor  = input.color(#78909C, "Finished", group = "Display")
 
 if barstate.isfirst
     if not (timeframe.isminutes and timeframe.multiplier == 15)
         runtime.error("Use a 15-minute chart. Both pattern candles must be 15-minute candles.")
     if not chart.is_standard
         runtime.error("Use standard candles or bars.")
+    if useTpFloor and useTpCap and tpFloorPts > tpCapPts
+        runtime.error("TP floor must not be above the TP cap.")
 
+// ---------------------------------------------------------------- types
 type Setup
-    box   zoneBox
-    box   riskBox
-    line  entryLine
-    line  stopLine
-    line  tpLine
-    label tag
-    label executionMarker
-    label outcomeMarker
-    float stopPrice
-    float entryPrice
-    float tpPrice
-    float dPts
-    float rPts
+    box    zoneBox
+    box    riskBox
+    box    tpBox
+    box    oneRBox
+    label  tag
+    float  entry
+    float  stop
+    float  tp
+    float  oneR
+    float  rPts
+    float  dPts
     string pattern
-    bool  strong
-    int   createdBar
-    bool  tested = false
-    bool  drawn  = false
-    int   outcome = 0
+    bool   strong
+    int    createdBar
+    int    c3      = 0      // 1 = C3 closed green, -1 = red or flat, 0 = not closed yet
+    int    outcome = 0      // 1 = win, -1 = loss, 0 = open
+    float  pnl     = 0.0    // points, from entry to exit
+    bool   drawn   = true
+
+type Tally
+    int   wins   = 0
+    int   losses = 0
+    float pts    = 0.0
 
 var array<Setup> setups = array.new<Setup>()
+var Tally allTally     = Tally.new()
+var Tally greenTally   = Tally.new()
+var Tally redTally     = Tally.new()
+var Tally redExitTally = Tally.new()
+var int   ties         = 0
+var int   tiesBy1m     = 0
+var int   dropped      = 0
 
+// ---------------------------------------------------------------- helpers
 priceText(float v) =>
     str.tostring(v, format.mintick)
+
+num(float v) =>
+    str.tostring(v, "#.##")
+
+signed(float v) =>
+    (v > 0 ? "+" : "") + num(v)
+
+tagText(string pat, bool isStrong, float rp, float tpp, bool weak) =>
+    (isStrong ? "★ " : "") + pat + "  R " + num(rp) + "  TP +" + num(tpp) + (weak ? "  ⚠ C3 red" : "")
+
+tint(box b, color c, int fillT, int edgeT) =>
+    box.set_bgcolor(b, color.new(c, fillT))
+    box.set_border_color(b, color.new(c, edgeT))
+    box.set_text_color(b, color.new(c, edgeT))
+
+fadeBox(box b, color c) =>
+    tint(b, c, 96, 70)
+    box.set_border_style(b, line.style_dotted)
+
+extendTo(Setup s, int t) =>
+    box.set_right(s.zoneBox, t)
+    box.set_right(s.riskBox, t)
+    box.set_right(s.tpBox, t)
+    box.set_right(s.oneRBox, t)
 
 clearDrawing(Setup s) =>
     box.delete(s.zoneBox)
     box.delete(s.riskBox)
-    line.delete(s.entryLine)
-    line.delete(s.stopLine)
-    line.delete(s.tpLine)
+    box.delete(s.tpBox)
+    box.delete(s.oneRBox)
     label.delete(s.tag)
-    s.zoneBox := na
-    s.riskBox := na
-    s.entryLine := na
-    s.stopLine := na
-    s.tpLine := na
-    s.tag := na
+    s.tag   := na
     s.drawn := false
 
-wipe(Setup s) =>
-    clearDrawing(s)
-    label.delete(s.executionMarker)
-    label.delete(s.outcomeMarker)
+finish(Setup s, color c) =>
+    fadeBox(s.zoneBox, c)
+    fadeBox(s.riskBox, c)
+    fadeBox(s.tpBox, c)
+    fadeBox(s.oneRBox, c)
+    label.delete(s.tag)
+    s.tag := na
+
+addPts(Tally t, float pts) =>
+    if pts > 0
+        t.wins := t.wins + 1
+    else
+        t.losses := t.losses + 1
+    t.pts := t.pts + pts
+
+tallyText(Tally t) =>
+    int n = t.wins + t.losses
+    n == 0 ? "no trades yet" : str.tostring(t.wins) + "W " + str.tostring(t.losses) + "L · " + str.tostring(100.0 * t.wins / n, "#") + "% · net " + signed(t.pts) + " · avg " + signed(t.pts / n)
+
+// First 1m candle to reach a level settles a 15m candle that reached both.
+// 1 = TP first, -1 = stop first, 0 = no 1m data, or one 1m candle reached both.
+firstTouch(float tp, float stop, array<float> hs, array<float> ls) =>
+    int first = 0
+    for [i, h] in hs
+        bool hitTp   = h >= tp
+        bool hitStop = array.get(ls, i) <= stop
+        if hitTp or hitStop
+            first := hitTp == hitStop ? 0 : hitTp ? 1 : -1
+            break
+    first
+
+panelRow(table tb, int r, string k, string v, color bg, color kc, color vc) =>
+    table.cell(tb, 0, r, k, bgcolor = bg, text_color = kc, text_size = size.small, text_halign = text.align_left)
+    table.cell(tb, 1, r, v, bgcolor = bg, text_color = vc, text_size = size.small, text_halign = text.align_left)
 
 // ---------------------------------------------------------------- measurements
-float D         = low - low[1]
-float R         = close - low
-float rng       = high - low
-float closeFromLow = close - low
-// No lower-wick filter.
-float dMin      = minDPts
-float rMin      = minRiskPts
-float flooredTpDistance = useMinTp ? math.max(R, minTpPts) : R
-float tpDistance = useMaxTp ? math.min(flooredTpDistance, maxTpPts) : flooredTpDistance
+float D   = low - low[1]
+float R   = close - low
+float rng = high - low
 
 bool green1 = close[1] > open[1]
 bool red1   = close[1] < open[1]
 bool green2 = close > open
 bool red2   = close < open
 
-bool patA = green1 and green2
-bool patB = red1 and green2
-bool patC = green1 and red2
-bool shapeOk = green1 or green2
+float tpDist = R
+if useTpFloor
+    tpDist := math.max(tpDist, tpFloorPts)
+if useTpCap
+    tpDist := math.min(tpDist, tpCapPts)
 
-bool dispOk = D > 0 and D >= dMin
-bool riskOk = R > 0 and R >= rMin
-bool strong = green2 and rng > 0 and closeFromLow / rng >= 0.66
+bool   strong   = green2 and rng > 0 and (close - low) / rng >= strongPct / 100.0
+bool   newSetup = barstate.isconfirmed and bar_index > 0 and (green1 or green2) and D > 0 and R > 0 and R >= minRiskPts
+string pattern  = green1 and green2 ? "A  G/G" : red1 and green2 ? "B  R/G" : green1 and red2 ? "C  G/R" : "doji + G"
 
-bool newSetup = barstate.isconfirmed and bar_index > 0 and shapeOk and dispOk and riskOk
-string pattern = patA ? "A  G/G" : patB ? "B  R/G" : patC ? "C  G/R" : "GREEN + DOJI"
+// 1m highs and lows inside the current 15m candle, used only for candles reaching both levels.
+[ltfHigh, ltfLow] = request.security_lower_tf(syminfo.tickerid, "1", [high, low])
 
-// ---------------------------------------------------------------- monitor
-bool tpFirstThisBar = false
-bool stopFirstThisBar = false
-if array.size(setups) > 0
-    for i = array.size(setups) - 1 to 0
-        Setup s = array.get(setups, i)
-        // Candle 3 executes only when green; otherwise cancel the setup.
-        if s.outcome == 0 and bar_index == s.createdBar + 1 and close <= open
-            s.outcome := 2
-            s.tested := true
-            clearDrawing(s)
-        // The first eligible candle is the green bar immediately after candle 2.
-        if s.outcome == 0 and bar_index > s.createdBar
-            if bar_index == s.createdBar + 1 and showMarks and na(s.executionMarker)
-                s.executionMarker := label.new(x = time, y = low, text = "●", xloc = xloc.bar_time, yloc = yloc.belowbar, style = label.style_none, textcolor = color.new(starColor, 0), size = size.small, tooltip = "Long execution: pattern candle 3")
-            if s.drawn
-                box.set_right(s.zoneBox, time_close)
-                box.set_right(s.riskBox, time_close)
-                line.set_x2(s.entryLine, time_close)
-                line.set_x2(s.stopLine, time_close)
-                line.set_x2(s.tpLine, time_close)
-            // Fifteen-minute rule: TP has priority when the same candle spans both
-            // levels. This lets candle 3 record its target immediately as a success.
-            int result = high >= s.tpPrice ? 1 : low <= s.stopPrice ? -1 : 0
-            if result != 0
-                s.outcome := result
-                s.tested := true
-                tpFirstThisBar := tpFirstThisBar or result == 1
-                stopFirstThisBar := stopFirstThisBar or result == -1
-                if showMarks
-                    s.outcomeMarker := label.new(x = time, y = high, text = result == 1 ? "✓" : "✕", xloc = xloc.bar_time, yloc = yloc.abovebar, style = label.style_none, textcolor = result == 1 ? color.new(starColor, 0) : color.new(stopColor, 0), size = size.small, tooltip = result == 1 ? "TP success: 1R target reached (TP has same-bar priority)" : "SL first: stop reached before a 1R target candle")
-                if keepTested and s.drawn
-                    color resultColor = result == 1 ? starColor : testedColor
-                    box.set_bgcolor(s.zoneBox, color.new(resultColor, 97))
-                    box.set_border_color(s.zoneBox, color.new(resultColor, 70))
-                    box.set_bgcolor(s.riskBox, color.new(resultColor, 97))
-                    box.set_border_color(s.riskBox, color.new(resultColor, 70))
-                    line.set_color(s.entryLine, color.new(resultColor, 60))
-                    line.set_color(s.stopLine, color.new(resultColor, 60))
-                    line.set_color(s.tpLine, color.new(resultColor, 60))
-                    line.set_style(s.entryLine, line.style_dotted)
-                    line.set_style(s.stopLine, line.style_dotted)
-                    line.set_style(s.tpLine, line.style_dotted)
-                    label.delete(s.tag)
-                    s.tag := na
-                else
-                    clearDrawing(s)
+// ---------------------------------------------------------------- monitor open trades
+bool tpHit   = false
+bool stopHit = false
+bool weakNow = false
+for s in setups
+    if s.outcome != 0 or bar_index <= s.createdBar
+        continue
+    bool isC3 = bar_index == s.createdBar + 1
+    if isC3
+        s.c3 := close > open ? 1 : -1
+    if s.drawn
+        extendTo(s, time_close)
+
+    bool   hitTp   = high >= s.tp
+    bool   hitStop = low <= s.stop
+    int    result  = hitTp == hitStop ? 0 : hitTp ? 1 : -1
+    string how     = ""
+    if hitTp and hitStop
+        int first = tieMode == "1m data, else loss" ? firstTouch(s.tp, s.stop, ltfHigh, ltfLow) : 0
+        ties     += 1
+        tiesBy1m += first != 0 ? 1 : 0
+        how      := first != 0 ? "\nSame candle: 1m data shows the " + (first == 1 ? "TP" : "stop") + " first." : "\nSame candle, order unknown: scored by the setting."
+        result   := first != 0 ? first : tieMode == "Always win" ? 1 : -1
+
+    if result != 0
+        s.outcome := result
+        s.pnl     := (result == 1 ? s.tp : math.min(s.stop, open)) - s.entry
+        Tally grp = s.c3 == 1 ? greenTally : redTally
+        addPts(allTally, s.pnl)
+        addPts(grp, s.pnl)
+        tpHit   := tpHit or result == 1
+        stopHit := stopHit or result == -1
+        if showMarks
+            label.new(x = time, y = high, text = result == 1 ? "✓" : "✕", xloc = xloc.bar_time, yloc = yloc.abovebar, style = label.style_none, textcolor = result == 1 ? starColor : stopColor, size = size.small, tooltip = (result == 1 ? "Win: scalp TP reached, " : "Loss: stop reached, ") + signed(s.pnl) + " pts." + how)
+        if s.drawn
+            if keepTested
+                finish(s, result == 1 ? starColor : doneColor)
+            else
+                clearDrawing(s)
+
+    // Candle 3 verdict, taken at its close. Colour is not final while C3 is forming.
+    if isC3 and barstate.isconfirmed
+        if s.c3 == -1
+            addPts(redExitTally, s.outcome != 0 ? s.pnl : close - s.entry)
+            if s.outcome == 0
+                weakNow := true
+                if s.drawn
+                    tint(s.zoneBox, warnColor, 85, 35)
+                    tint(s.tpBox, warnColor, 85, 35)
+                    if not na(s.tag)
+                        label.set_text(s.tag, tagText(s.pattern, s.strong, s.rPts, s.tp - s.entry, true))
+                        label.set_textcolor(s.tag, color.new(warnColor, 0))
+        if showMarks
+            label.new(x = time, y = low, text = s.c3 == 1 ? "●" : "⚠", xloc = xloc.bar_time, yloc = yloc.belowbar, style = label.style_none, textcolor = s.c3 == 1 ? starColor : warnColor, size = size.small, tooltip = s.c3 == 1 ? "C3 closed green: trade confirmed." : s.outcome != 0 ? "C3 closed red. The trade already finished on this candle." : "C3 closed red: weak trade.\nTighten the stop or exit early. Do not add.")
 
 // ---------------------------------------------------------------- new setup
 if newSetup
-    if array.size(setups) >= monitored
-        Setup oldest = array.shift(setups)
-        wipe(oldest)
-    int liveDrawn = 0
+    // Keep the newest drawings, drop finished setups nobody can see.
     if array.size(setups) > 0
+        int shown = 0
         for i = array.size(setups) - 1 to 0
             Setup s = array.get(setups, i)
             if s.drawn
-                liveDrawn += 1
-                if liveDrawn >= drawnZones
+                shown += 1
+                if shown >= drawnZones
                     clearDrawing(s)
-            if labelMode == "Latest only" and not na(s.tag)
+            if labelMode == "Latest only"
                 label.delete(s.tag)
                 s.tag := na
+            if s.outcome != 0 and not s.drawn
+                array.remove(setups, i)
+    // Still full: remove a finished setup first; an open one only if none is finished.
+    if array.size(setups) >= monitored
+        int victim = 0
+        for [i, s] in setups
+            if s.outcome != 0
+                victim := i
+                break
+        Setup old = array.remove(setups, victim)
+        clearDrawing(old)
+        if old.outcome == 0
+            dropped += 1
 
-    color zc = strong ? starColor : zoneColor
-    float target = close + tpDistance
-    // C is drawn hollow with a dashed edge so it reads as the weaker case
-    box z = box.new(left = time[1], top = math.max(low, low[1]), right = time_close, bottom = math.min(low, low[1]), xloc = xloc.bar_time, border_color = color.new(zc, patC ? 30 : 55), border_width = 1, border_style = patC ? line.style_dashed : line.style_solid, bgcolor = color.new(zc, patC ? 100 : (strong ? 86 : 93)), text = "D " + priceText(D), text_color = color.new(zc, 10), text_size = size.tiny)
-    box rb = box.new(left = time, top = close, right = time_close, bottom = low, xloc = xloc.bar_time, border_color = color.new(stopColor, 35), border_width = 1, bgcolor = color.new(stopColor, 92), text = "R " + priceText(R), text_color = color.new(stopColor, 5), text_size = size.tiny)
-    line en = line.new(x1 = time, y1 = close, x2 = time_close, y2 = close, xloc = xloc.bar_time, color = color.new(chart.fg_color, 35), width = 1)
-    line sl = line.new(x1 = time, y1 = low, x2 = time_close, y2 = low, xloc = xloc.bar_time, color = color.new(stopColor, 35), width = 1)
-    line tp = line.new(x1 = time, y1 = target, x2 = time_close, y2 = target, xloc = xloc.bar_time, color = color.new(starColor, 20), width = 1)
-    label tag = na
+    color zc   = strong ? starColor : zoneColor
+    float tpPx = close + tpDist
+    float oneR = close + R
+    bool  same = math.abs(oneR - tpPx) < syminfo.mintick / 2
+    box zb = box.new(left = time[1], top = low, right = time_close, bottom = low[1], xloc = xloc.bar_time, border_color = color.new(zc, 55), bgcolor = color.new(zc, strong ? 86 : 93), text = "D " + num(D), text_color = color.new(zc, 10), text_size = size.tiny)
+    box rb = box.new(left = time, top = close, right = time_close, bottom = low, xloc = xloc.bar_time, border_color = color.new(stopColor, 35), bgcolor = color.new(stopColor, 90), text = "SL -" + num(R), text_color = color.new(stopColor, 5), text_size = size.tiny)
+    box tb = box.new(left = time, top = tpPx, right = time_close, bottom = close, xloc = xloc.bar_time, border_color = color.new(zc, 35), bgcolor = color.new(zc, 88), text = "TP +" + num(tpDist) + (same ? " = 1R" : ""), text_color = color.new(zc, 5), text_size = size.tiny)
+    box ob = box.new(left = time, top = math.max(tpPx, oneR), right = time_close, bottom = math.min(tpPx, oneR), xloc = xloc.bar_time, border_color = color.new(chart.fg_color, 55), border_style = line.style_dashed, bgcolor = color.new(chart.fg_color, 100), text = same ? "" : "1R +" + num(R), text_color = color.new(chart.fg_color, 35), text_size = size.tiny, text_valign = text.align_top)
+    label tg = na
     if labelMode != "None"
-        string t = (strong ? "★ " : "") + priceText(D) + "D · " + priceText(R) + "R"
-        tag := label.new(x = time, y = low, text = t, xloc = xloc.bar_time, style = label.style_none, textcolor = color.new(zc, 15), size = size.tiny)
-    label executionMarker = na
-    label outcomeMarker = na
-    array.push(setups, Setup.new(z, rb, en, sl, tp, tag, executionMarker, outcomeMarker, low, close, target, D, R, pattern, strong, bar_index, false, true, 0))
+        tg := label.new(x = time, y = low[1], text = tagText(pattern, strong, R, tpDist, false), xloc = xloc.bar_time, yloc = yloc.price, style = label.style_label_up, color = color.new(zc, 100), textcolor = color.new(zc, 10), size = size.tiny)
+    array.push(setups, Setup.new(zoneBox = zb, riskBox = rb, tpBox = tb, oneRBox = ob, tag = tg, entry = close, stop = low, tp = tpPx, oneR = oneR, rPts = R, dPts = D, pattern = pattern, strong = strong, createdBar = bar_index))
 
-// ---------------------------------------------------------------- readout
-int liveCount = 0
-if barstate.islast and array.size(setups) > 0
-    for i = 0 to array.size(setups) - 1
-        if not array.get(setups, i).tested
-            liveCount += 1
+// ---------------------------------------------------------------- data window + alerts
+plot(newSetup ? close : na, "Entry", display = display.data_window)
+plot(newSetup ? low : na, "Stop", display = display.data_window)
+plot(newSetup ? close + tpDist : na, "Scalp TP", display = display.data_window)
+plot(newSetup ? close + R : na, "1R target", display = display.data_window)
+plot(newSetup ? R : na, "R pts", display = display.data_window)
+plot(newSetup ? D : na, "D pts", display = display.data_window)
 
-plot(newSetup ? close : na, title = "Entry", display = display.data_window)
-plot(newSetup ? low : na, title = "Stop", display = display.data_window)
-plot(newSetup ? close + tpDistance : na, title = "TP", display = display.data_window)
-plot(newSetup ? D : na, title = "D pts", display = display.data_window)
-plot(newSetup ? R : na, title = "R pts", display = display.data_window)
-plot(dMin, title = "D minimum", display = display.data_window)
-plot(rMin, title = "R minimum", display = display.data_window)
+alertcondition(newSetup, "New setup", 'DL15 long {{ticker}}: entry {{close}} (C2 close / C3 open), stop {{low}}, scalp TP {{plot("Scalp TP")}}, 1R {{plot("1R target")}}')
+alertcondition(newSetup and strong, "New strong-close setup", 'DL15 ★ long {{ticker}}: entry {{close}} (C2 close / C3 open), stop {{low}}, scalp TP {{plot("Scalp TP")}}, 1R {{plot("1R target")}}')
+alertcondition(weakNow, "C3 red warning", "DL15 ⚠ {{ticker}} candle 3 closed red: weak trade. Tighten the stop or exit early. Do not add.")
+alertcondition(tpHit, "Scalp TP hit", "DL15 {{ticker}}: an open trade reached its scalp TP.")
+alertcondition(stopHit, "Stop hit", "DL15 {{ticker}}: an open trade reached its stop.")
 
-alertcondition(newSetup, title = "New displacement setup", message = "15m bullish displacement setup confirmed.")
-alertcondition(newSetup and strong, title = "New strong-close setup", message = "15m bullish displacement setup with a strong close.")
-alertcondition(tpFirstThisBar, title = "1R TP success", message = "A monitored setup reached its 1R TP. TP has priority when both levels occur in one 15m candle.")
-alertcondition(stopFirstThisBar, title = "SL first", message = "A monitored setup reached its stop before its 1R TP.")
-
-var table panel = table.new(position.top_right, 2, 9, border_width = 0, frame_width = 1, frame_color = color.new(color.gray, 70))
+// ---------------------------------------------------------------- panel
+var table panel = table.new(position.top_right, 2, 13, border_width = 0, frame_width = 1, frame_color = color.new(color.gray, 70))
 if barstate.islast and showPanel
-    color bg  = color.new(chart.bg_color, 15)
-    color ink = chart.fg_color
-    color dim = color.new(chart.fg_color, 45)
-    bool has = array.size(setups) > 0
-    string head = "WAITING"
-    if has
-        Setup newest = array.get(setups, array.size(setups) - 1)
-        head := (newest.outcome == 1 ? "TP SUCCESS ✓" : newest.outcome == -1 ? "SL FIRST ✕" : newest.outcome == 2 ? "NO ENTRY" : "LIVE") + (newest.strong ? "  ★" : "")
-    table.cell(panel, 0, 0, "DL15", bgcolor = color.new(zoneColor, 20), text_color = color.white, text_size = size.small)
-    table.cell(panel, 1, 0, head, bgcolor = color.new(zoneColor, 20), text_color = color.white, text_size = size.small)
-    table.cell(panel, 0, 1, "min D / R", bgcolor = bg, text_color = dim, text_size = size.small)
-    table.cell(panel, 1, 1, priceText(dMin) + " / " + priceText(rMin), bgcolor = bg, text_color = dim, text_size = size.small)
-    if has
-        Setup last = array.get(setups, array.size(setups) - 1)
-        table.cell(panel, 0, 2, "pattern", bgcolor = bg, text_color = dim, text_size = size.small)
-        table.cell(panel, 1, 2, last.pattern, bgcolor = bg, text_color = ink, text_size = size.small)
-        table.cell(panel, 0, 3, "entry", bgcolor = bg, text_color = dim, text_size = size.small)
-        table.cell(panel, 1, 3, priceText(last.entryPrice), bgcolor = bg, text_color = ink, text_size = size.small)
-        table.cell(panel, 0, 4, "stop", bgcolor = bg, text_color = dim, text_size = size.small)
-        table.cell(panel, 1, 4, priceText(last.stopPrice), bgcolor = bg, text_color = stopColor, text_size = size.small)
-        table.cell(panel, 0, 5, "D", bgcolor = bg, text_color = dim, text_size = size.small)
-        table.cell(panel, 1, 5, priceText(last.dPts), bgcolor = bg, text_color = ink, text_size = size.small)
-        table.cell(panel, 0, 6, "R", bgcolor = bg, text_color = dim, text_size = size.small)
-        table.cell(panel, 1, 6, priceText(last.rPts), bgcolor = bg, text_color = ink, text_size = size.small)
-        table.cell(panel, 0, 7, "D / R", bgcolor = bg, text_color = dim, text_size = size.small)
-        table.cell(panel, 1, 7, str.tostring(last.dPts / last.rPts, "#.##"), bgcolor = bg, text_color = ink, text_size = size.small)
-        table.cell(panel, 0, 8, "TP / tracked", bgcolor = bg, text_color = dim, text_size = size.small)
-        table.cell(panel, 1, 8, priceText(last.tpPrice) + " / " + str.tostring(liveCount) + " live", bgcolor = bg, text_color = ink, text_size = size.small)
+    color  bg     = color.new(chart.bg_color, 15)
+    color  ink    = chart.fg_color
+    color  dim    = color.new(chart.fg_color, 45)
+    string head   = "WAITING"
+    color  headBg = color.new(zoneColor, 20)
+    int openCount = 0
+    for s in setups
+        openCount += s.outcome == 0 ? 1 : 0
+    if array.size(setups) > 0
+        Setup cur     = array.last(setups)
+        bool  forming = bar_index == cur.createdBar + 1 and not barstate.isconfirmed
+        float tpPts   = cur.tp - cur.entry
+        head := cur.outcome == 1 ? "WIN ✓  " + signed(cur.pnl) : cur.outcome == -1 ? "LOSS ✕  " + signed(cur.pnl) : bar_index == cur.createdBar ? "NEW · enter at open" : forming ? "LIVE · C3 forming" : cur.c3 == 1 ? "LIVE · C3 green" : "LIVE ⚠ WEAK · C3 red"
+        if cur.outcome == 0 and cur.c3 == -1 and not forming
+            headBg := color.new(warnColor, 10)
+        panelRow(panel, 1, "setup", (cur.strong ? "★ " : "") + cur.pattern, bg, dim, ink)
+        panelRow(panel, 2, "entry", priceText(cur.entry) + "  C2 close", bg, dim, ink)
+        panelRow(panel, 3, "stop", priceText(cur.stop) + "  -" + num(cur.rPts), bg, dim, stopColor)
+        panelRow(panel, 4, "scalp TP", priceText(cur.tp) + "  +" + num(tpPts), bg, dim, starColor)
+        panelRow(panel, 5, "1R", priceText(cur.oneR) + "  +" + num(cur.rPts), bg, dim, ink)
+        panelRow(panel, 6, "TP/R · D", num(tpPts / cur.rPts) + " · D " + num(cur.dPts), bg, dim, ink)
+    table.cell(panel, 0, 0, "DL15", bgcolor = headBg, text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(panel, 1, 0, head, bgcolor = headBg, text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    panelRow(panel, 7, "all trades", tallyText(allTally), bg, dim, ink)
+    panelRow(panel, 8, "C3 green", tallyText(greenTally), bg, dim, ink)
+    panelRow(panel, 9, "C3 red, held", tallyText(redTally), bg, dim, warnColor)
+    panelRow(panel, 10, "C3 red, out at C3 close", tallyText(redExitTally), bg, dim, warnColor)
+    panelRow(panel, 11, "open trades", str.tostring(openCount) + (dropped > 0 ? " · " + str.tostring(dropped) + " dropped unscored" : ""), bg, dim, ink)
+    panelRow(panel, 12, "TP + stop same candle", str.tostring(ties) + " · " + str.tostring(tiesBy1m) + " settled by 1m", bg, dim, ink)
